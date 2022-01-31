@@ -10,6 +10,8 @@ NOTE: This pulls many parameters/options for what you'd like from the cdk.json c
 Have a look there for many options you can change to customise this template for your environments/needs.
 """
 
+from constructs import Construct
+from aws_cdk import App, Stack, Environment, CfnOutput, RemovalPolicy
 from aws_cdk import (
     aws_ec2 as ec2,
     aws_eks as eks,
@@ -18,19 +20,15 @@ from aws_cdk import (
     aws_logs as logs,
     aws_certificatemanager as cm,
     aws_efs as efs,
-    core
+    aws_aps as aps
 )
 import os
 import yaml
 
-# Import the custom resource to switch on control plane logging from ekslogs_custom_resource.py
-from ekslogs_custom_resource import EKSLogsObjectResource
-from amp_custom_resource import AMPCustomResource
 
+class EKSClusterStack(Stack):
 
-class EKSClusterStack(core.Stack):
-
-    def __init__(self, scope: core.Construct, id: str, **kwargs) -> None:
+    def __init__(self, scope: Construct, id: str, **kwargs) -> None:
         super().__init__(scope, id, **kwargs)
 
         # Either create a new IAM role to administrate the cluster or create a new one
@@ -49,7 +47,7 @@ class EKSClusterStack(core.Stack):
                 ],
                 "Resource": "*"
             }
-            cluster_admin_role.add_to_policy(
+            cluster_admin_role.add_to_principal_policy(
                 iam.PolicyStatement.from_json(cluster_admin_policy_statement_json_1))
         else:
             # You'll also need to add a trust relationship to ec2.amazonaws.com to sts:AssumeRole to this as well
@@ -64,10 +62,6 @@ class EKSClusterStack(core.Stack):
                 self, "VPC",
                 # We are choosing to spread our VPC across 3 availability zones
                 max_azs=3,
-                # We are creating a VPC that has a /22, 1024 IPs, for our EKS cluster.
-                # I am using that instead of a /16 etc. as I know many companies have constraints here
-                # If you can go bigger than this great - but I would try not to go much smaller if you can
-                # I use https://www.davidc.net/sites/default/subnets/subnets.html to me work out the CIDRs
                 cidr=self.node.try_get_context("vpc_cidr"),
                 subnet_configuration=[
                     # 3 x Public Subnets (1 per AZ) with 64 IPs each for our ALBs and NATs
@@ -79,7 +73,7 @@ class EKSClusterStack(core.Stack):
                     ),
                     # 3 x Private Subnets (1 per AZ) with 256 IPs each for our Nodes and Pods
                     ec2.SubnetConfiguration(
-                        subnet_type=ec2.SubnetType.PRIVATE,
+                        subnet_type=ec2.SubnetType.PRIVATE_WITH_NAT,
                         name="Private",
                         cidr_mask=self.node.try_get_context(
                             "vpc_cidr_mask_private")
@@ -100,7 +94,10 @@ class EKSClusterStack(core.Stack):
             endpoint_access=eks.EndpointAccess.PRIVATE,
             version=eks.KubernetesVersion.of(
                 self.node.try_get_context("eks_version")),
-            default_capacity=0
+            default_capacity=0,
+            cluster_logging=[eks.ClusterLoggingTypes.API, eks.ClusterLoggingTypes.AUDIT,
+                             eks.ClusterLoggingTypes.AUTHENTICATOR, eks.ClusterLoggingTypes.CONTROLLER_MANAGER,
+                             eks.ClusterLoggingTypes.SCHEDULER]
         )
 
         # Create a Fargate Pod Execution Role to use with any Fargate Profiles
@@ -112,47 +109,38 @@ class EKSClusterStack(core.Stack):
                 "AmazonEKSFargatePodExecutionRolePolicy")]
         )
 
-        # Enable control plane logging (via ekslogs_custom_resource.py)
-        # This requires a custom resource until that has CloudFormation Support
-        # TODO: remove this when no longer required when CF support launches
-        eks_logs_custom_resource = EKSLogsObjectResource(
-            self, "EKSLogsObjectResource",
-            eks_name=eks_cluster.cluster_name,
-            eks_arn=eks_cluster.cluster_arn
-        )
-
         # Create the CF exports that let you rehydrate the Cluster object in other stack(s)
         if (self.node.try_get_context("create_cluster_exports") == "True"):
             # Output the EKS Cluster Name and Export it
-            core.CfnOutput(
+            CfnOutput(
                 self, "EKSClusterName",
                 value=eks_cluster.cluster_name,
                 description="The name of the EKS Cluster",
                 export_name="EKSClusterName"
             )
             # Output the EKS Cluster OIDC Issuer and Export it
-            core.CfnOutput(
+            CfnOutput(
                 self, "EKSClusterOIDCProviderARN",
                 value=eks_cluster.open_id_connect_provider.open_id_connect_provider_arn,
                 description="The EKS Cluster's OIDC Provider ARN",
                 export_name="EKSClusterOIDCProviderARN"
             )
             # Output the EKS Cluster kubectl Role ARN
-            core.CfnOutput(
+            CfnOutput(
                 self, "EKSClusterKubectlRoleARN",
                 value=eks_cluster.kubectl_role.role_arn,
                 description="The EKS Cluster's kubectl Role ARN",
                 export_name="EKSClusterKubectlRoleARN"
             )
             # Output the EKS Cluster SG ID
-            core.CfnOutput(
+            CfnOutput(
                 self, "EKSSGID",
                 value=eks_cluster.kubectl_security_group.security_group_id,
                 description="The EKS Cluster's kubectl SG ID",
                 export_name="EKSSGID"
             )
             # Output the EKS Fargate Pod Execution Role (to use for logging to work)
-            core.CfnOutput(
+            CfnOutput(
                 self, "EKSFargatePodExecRoleArn",
                 value=fargate_pod_execution_role.role_arn,
                 description="The EKS Cluster's Fargate Pod Execution Role ARN",
@@ -182,6 +170,7 @@ class EKSClusterStack(core.Stack):
                 "cluster-default-ng",
                 capacity_type=node_capacity_type,
                 desired_size=self.node.try_get_context("eks_node_quantity"),
+                min_size=self.node.try_get_context("eks_node_min_quantity"),
                 max_size=self.node.try_get_context("eks_node_max_quantity"),
                 disk_size=self.node.try_get_context("eks_node_disk_size"),
                 # The default in CDK is to force upgrades through even if they violate - it is safer to not do that
@@ -425,7 +414,7 @@ class EKSClusterStack(core.Stack):
             awslbcontroller_chart = eks_cluster.add_helm_chart(
                 "aws-load-balancer-controller",
                 chart="aws-load-balancer-controller",
-                version="1.3.2",
+                version="1.3.3",
                 release="awslbcontroller",
                 repository="https://aws.github.io/eks-charts",
                 namespace="kube-system",
@@ -485,9 +474,9 @@ class EKSClusterStack(core.Stack):
             }
 
             # Attach the necessary permissions
-            externaldns_service_account.add_to_policy(
+            externaldns_service_account.add_to_principal_policy(
                 iam.PolicyStatement.from_json(externaldns_policy_statement_json_1))
-            externaldns_service_account.add_to_policy(
+            externaldns_service_account.add_to_principal_policy(
                 iam.PolicyStatement.from_json(externaldns_policy_statement_json_2))
 
             # Deploy External DNS from the bitnami Helm chart
@@ -496,7 +485,7 @@ class EKSClusterStack(core.Stack):
             externaldns_chart = eks_cluster.add_helm_chart(
                 "external-dns",
                 chart="external-dns",
-                version="1.6.0",
+                version="1.7.1",
                 release="externaldns",
                 repository="https://kubernetes-sigs.github.io/external-dns/",
                 namespace="kube-system",
@@ -681,11 +670,11 @@ class EKSClusterStack(core.Stack):
                 awsebscsidriver_policy)
 
             # Install the AWS EBS CSI Driver
-            # For more info see https://github.com/kubernetes-sigs/aws-ebs-csi-driver
+            # For more info see https://github.com/kubernetes-sigs/aws-ebs-csi-driver/tree/master/charts/aws-ebs-csi-driver
             awsebscsi_chart = eks_cluster.add_helm_chart(
                 "aws-ebs-csi-driver",
                 chart="aws-ebs-csi-driver",
-                version="2.4.0",
+                version="2.6.2",
                 release="awsebscsidriver",
                 repository="https://kubernetes-sigs.github.io/aws-ebs-csi-driver",
                 namespace="kube-system",
@@ -762,19 +751,19 @@ class EKSClusterStack(core.Stack):
             }
 
             # Attach the necessary permissions
-            awsefscsidriver_service_account.add_to_policy(
+            awsefscsidriver_service_account.add_to_principal_policy(
                 iam.PolicyStatement.from_json(awsefscsidriver_policy_statement_json_1))
-            awsefscsidriver_service_account.add_to_policy(
+            awsefscsidriver_service_account.add_to_principal_policy(
                 iam.PolicyStatement.from_json(awsefscsidriver_policy_statement_json_2))
-            awsefscsidriver_service_account.add_to_policy(
+            awsefscsidriver_service_account.add_to_principal_policy(
                 iam.PolicyStatement.from_json(awsefscsidriver_policy_statement_json_3))
 
             # Install the AWS EFS CSI Driver
-            # For more info see https://github.com/kubernetes-sigs/aws-efs-csi-driver
+            # For more info see https://github.com/kubernetes-sigs/aws-efs-csi-driver/tree/release-1.3/charts/aws-efs-csi-driver
             awsefscsi_chart = eks_cluster.add_helm_chart(
                 "aws-efs-csi-driver",
                 chart="aws-efs-csi-driver",
-                version="2.2.0",
+                version="2.2.3",
                 release="awsefscsidriver",
                 repository="https://kubernetes-sigs.github.io/aws-efs-csi-driver/",
                 namespace="kube-system",
@@ -821,7 +810,7 @@ class EKSClusterStack(core.Stack):
                 self, "EFSFilesystem",
                 vpc=eks_vpc,
                 security_group=efs_security_group,
-                removal_policy=core.RemovalPolicy.DESTROY
+                removal_policy=RemovalPolicy.DESTROY
             )
 
             # Set up the StorageClass pointing at the new CSI Driver
@@ -867,15 +856,15 @@ class EKSClusterStack(core.Stack):
             }
 
             # Attach the necessary permissions
-            clusterautoscaler_service_account.add_to_policy(
+            clusterautoscaler_service_account.add_to_principal_policy(
                 iam.PolicyStatement.from_json(clusterautoscaler_policy_statement_json_1))
 
             # Install the Cluster Autoscaler
-            # For more info see https://github.com/kubernetes/autoscaler
+            # For more info see https://github.com/kubernetes/autoscaler/tree/master/charts/cluster-autoscaler
             clusterautoscaler_chart = eks_cluster.add_helm_chart(
                 "cluster-autoscaler",
                 chart="cluster-autoscaler",
-                version="9.10.8",
+                version="9.11.0",
                 release="clusterautoscaler",
                 repository="https://kubernetes.github.io/autoscaler",
                 namespace="kube-system",
@@ -955,7 +944,7 @@ class EKSClusterStack(core.Stack):
             # and defaults to one node in a single availability zone
             os_domain = opensearch.Domain(
                 self, "OSDomain",
-                removal_policy=core.RemovalPolicy.DESTROY,
+                removal_policy=RemovalPolicy.DESTROY,
                 # https://docs.aws.amazon.com/cdk/api/latest/docs/@aws-cdk_aws-opensearchservice.EngineVersion.html
                 version=opensearch.EngineVersion.OPENSEARCH_1_0,
                 vpc=eks_vpc,
@@ -969,7 +958,7 @@ class EKSClusterStack(core.Stack):
             )
 
             # Output the OpenSearch Dashboards address in our CloudFormation Stack
-            core.CfnOutput(
+            CfnOutput(
                 self, "OpenSearchDashboardsAddress",
                 value="https://" + os_domain.domain_endpoint + "/_dashboards/",
                 description="Private endpoint for this EKS environment's OpenSearch to consume the logs",
@@ -994,7 +983,7 @@ class EKSClusterStack(core.Stack):
             }
 
             # Add the policies to the service account
-            fluentbit_service_account.add_to_policy(
+            fluentbit_service_account.add_to_principal_policy(
                 iam.PolicyStatement.from_json(fluentbit_policy_statement_json_1))
             os_domain.grant_write(fluentbit_service_account)
 
@@ -1002,7 +991,7 @@ class EKSClusterStack(core.Stack):
             fluentbit_chart = eks_cluster.add_helm_chart(
                 "fluentbit",
                 chart="fluent-bit",
-                version="0.19.6",
+                version="0.19.17",
                 release="fluent-bit",
                 repository="https://fluent.github.io/helm-charts",
                 namespace="kube-system",
@@ -1273,7 +1262,7 @@ class EKSClusterStack(core.Stack):
             }
 
             # Add the policies to the service account
-            fluentbit_cw_service_account.add_to_policy(
+            fluentbit_cw_service_account.add_to_principal_policy(
                 iam.PolicyStatement.from_json(fluentbit_cw_policy_statement_json_1))
 
             # For more info check out https://github.com/fluent/helm-charts/tree/main/charts/fluent-bit
@@ -1281,7 +1270,7 @@ class EKSClusterStack(core.Stack):
             fluentbit_chart_cw = eks_cluster.add_helm_chart(
                 "fluentbit-cw",
                 chart="fluent-bit",
-                version="0.19.6",
+                version="0.19.17",
                 release="fluent-bit-cw",
                 repository="https://fluent.github.io/helm-charts",
                 namespace="kube-system",
@@ -1332,7 +1321,7 @@ class EKSClusterStack(core.Stack):
                 )
                 # We don't want to clean this up on Delete - it is a one-time patch to let the Helm Chart own the resources
                 patch_resource = patch.node.find_child("Resource")
-                patch_resource.apply_removal_policy(core.RemovalPolicy.RETAIN)
+                patch_resource.apply_removal_policy(RemovalPolicy.RETAIN)
                 # Keep track of all the patches to set dependencies down below
                 patches.append(patch)
 
@@ -1356,7 +1345,7 @@ class EKSClusterStack(core.Stack):
             sg_pods_chart = eks_cluster.add_helm_chart(
                 "aws-vpc-cni",
                 chart="aws-vpc-cni",
-                version="1.1.10",
+                version="1.1.12",
                 release="aws-vpc-cni",
                 repository="https://aws.github.io/eks-charts",
                 namespace="kube-system",
@@ -1401,7 +1390,7 @@ class EKSClusterStack(core.Stack):
             csi_secrets_store_chart = eks_cluster.add_helm_chart(
                 "csi-secrets-store",
                 chart="secrets-store-csi-driver",
-                version="1.0.0",
+                version="1.0.1",
                 release="csi-secrets-store",
                 repository="https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts",
                 namespace="kube-system",
@@ -1433,7 +1422,7 @@ class EKSClusterStack(core.Stack):
                 "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
                 "Resource": ["*"]
             }
-            secrets_csi_sa.add_to_policy(iam.PolicyStatement.from_json(
+            secrets_csi_sa.add_to_principal_policy(iam.PolicyStatement.from_json(
                 secrets_csi_policy_statement_json_1))
 
             # Deploy the manifests from secrets-store-csi-driver-provider-aws.yaml
@@ -1476,15 +1465,15 @@ class EKSClusterStack(core.Stack):
             }
 
             # Add the policies to the service account
-            externalsecrets_service_account.add_to_policy(
+            externalsecrets_service_account.add_to_principal_policy(
                 iam.PolicyStatement.from_json(externalsecrets_policy_statement_json_1))
 
             # Deploy the Helm Chart
-            # For more information see https://github.com/external-secrets/kubernetes-external-secrets
+            # For more information see https://github.com/external-secrets/kubernetes-external-secrets/tree/master/charts/kubernetes-external-secrets
             external_secrets_chart = eks_cluster.add_helm_chart(
                 "external-secrets",
                 chart="kubernetes-external-secrets",
-                version="8.4.0",
+                version="8.5.1",
                 repository="https://external-secrets.github.io/kubernetes-external-secrets/",
                 namespace="kube-system",
                 release="external-secrets",
@@ -1535,11 +1524,11 @@ class EKSClusterStack(core.Stack):
                     "kubecostToken": self.node.try_get_context("kubecost_token")}
 
             # Deploy the Helm Chart
-            # For more information see https://github.com/kubecost/cost-analyzer-helm-chart/tree/master
+            # For more information see https://github.com/kubecost/cost-analyzer-helm-chart/tree/master/cost-analyzer
             kubecost_chart = eks_cluster.add_helm_chart(
                 "kubecost",
                 chart="cost-analyzer",
-                version="1.88.1",
+                version="1.89.2",
                 repository="https://kubecost.github.io/cost-analyzer/",
                 namespace="kube-system",
                 release="kubecost",
@@ -1578,17 +1567,8 @@ class EKSClusterStack(core.Stack):
         if (self.node.try_get_context("deploy_amp") == "True"):
             # For more information see https://aws.amazon.com/blogs/mt/getting-started-amazon-managed-service-for-prometheus/
 
-            # Use our AMPCustomResource to provision/deprovision the AMP
-            # TODO remove this and use the proper CDK construct when it becomes available
-            amp_workspace_id = AMPCustomResource(
-                self, "AMPCustomResource").workspace_id
-            # Output the AMP Workspace ID and Export it
-            core.CfnOutput(
-                self, "AMPWorkspaceID",
-                value=amp_workspace_id,
-                description="The ID of the AMP Workspace",
-                export_name="AMPWorkspaceID"
-            )
+            # Create AMP workspace
+            amp_workspace = aps.CfnWorkspace(self, "AMPWorkspace")
 
             # Create IRSA mapping
             amp_sa = eks_cluster.add_service_account(
@@ -1609,7 +1589,7 @@ class EKSClusterStack(core.Stack):
                 ],
                 "Resource": ["*"]
             }
-            amp_sa.add_to_policy(iam.PolicyStatement.from_json(
+            amp_sa.add_to_principal_policy(iam.PolicyStatement.from_json(
                 amp_policy_statement_json_1))
 
             # Install Prometheus with a low 1 hour local retention to ship the metrics to the AMP
@@ -1620,16 +1600,11 @@ class EKSClusterStack(core.Stack):
             amp_prometheus_chart = eks_cluster.add_helm_chart(
                 "prometheus-chart",
                 chart="kube-prometheus-stack",
-                version="21.0.2",
+                version="30.2.0",
                 release="prometheus-for-amp",
                 repository="https://prometheus-community.github.io/helm-charts",
                 namespace="kube-system",
                 values={
-                    "global": {
-                        "rbac":{
-                            "pspEnabled": False
-                        }
-                    },
                     "prometheus": {
                         "serviceAccount": {
                             "create": False,
@@ -1640,9 +1615,9 @@ class EKSClusterStack(core.Stack):
                         },
                         "prometheusSpec": {
                             "storageSpec": {
-                                    "emptyDir": {
-                                        "medium": "Memory"
-                                    }
+                                "emptyDir": {
+                                    "medium": "Memory"
+                                }
                             },
                             "remoteWrite": [{
                                 "queueConfig": {
@@ -1650,7 +1625,7 @@ class EKSClusterStack(core.Stack):
                                     "maxShards": 200,
                                     "capacity": 2500
                                 },
-                                "url": "https://aps-workspaces."+self.region+".amazonaws.com/workspaces/"+amp_workspace_id+"/api/v1/remote_write",
+                                "url": amp_workspace.attr_prometheus_endpoint+"api/v1/remote_write",
                                 "sigv4": {
                                     "region": self.region
                                 }
@@ -1681,8 +1656,8 @@ class EKSClusterStack(core.Stack):
                             "requests": {
                                 "cpu": "0.25",
                                 "memory": "0.5Gi"
+                            }
                         }
-                    }
                     },
                     "kubeControllerManager": {
                         "enabled": False
@@ -1712,7 +1687,7 @@ class EKSClusterStack(core.Stack):
             amp_grafana_chart = eks_cluster.add_helm_chart(
                 "amp-grafana-chart",
                 chart="grafana",
-                version="6.17.7",
+                version="6.21.1",
                 release="grafana-for-amp",
                 repository="https://grafana.github.io/helm-charts",
                 namespace="kube-system",
@@ -1743,7 +1718,7 @@ class EKSClusterStack(core.Stack):
                                 "name": "Prometheus",
                                 "type": "prometheus",
                                 "access": "proxy",
-                                "url": "https://aps-workspaces."+self.region+".amazonaws.com/workspaces/"+amp_workspace_id,
+                                "url": amp_workspace.attr_prometheus_endpoint,
                                 "isDefault": True,
                                 "editable": True,
                                 "jsonData": {
@@ -1829,13 +1804,6 @@ class EKSClusterStack(core.Stack):
                     namespace="kube-system",), eks.Selector(namespace="default")]
             )
 
-            # The enabling of logs fails if the Fargate Profile is getting created
-            # Tried the to make the Fargate Profile depend on the Logs CustomResource and
-            # that didn't fix it (I guess that returns COMPLETE before done). However,
-            # flipping it the other way and making the Logs depend on the Fargate worked
-            eks_logs_custom_resource.node.add_dependency(
-                default_fargate_profile)
-
         # Send Fargate logs to CloudWatch Logs
         if (self.node.try_get_context("fargate_logs_to_cloudwatch") == "True"):
             if (self.node.try_get_context("fargate_logs_to_managed_opensearch") == "False"):
@@ -1854,7 +1822,7 @@ class EKSClusterStack(core.Stack):
                     ],
                     "Resource": "*"
                 }
-                fargate_pod_execution_role.add_to_policy(
+                fargate_pod_execution_role.add_to_principal_policy(
                     iam.PolicyStatement.from_json(fargate_cw_logs_policy_statement_json_1))
 
                 fargate_namespace_manifest = eks_cluster.add_manifest("FargateLoggingNamespace", {
@@ -1905,7 +1873,7 @@ class EKSClusterStack(core.Stack):
                         os_domain.domain_arn
                     ]
                 }
-                fargate_pod_execution_role.add_to_policy(
+                fargate_pod_execution_role.add_to_principal_policy(
                     iam.PolicyStatement.from_json(fargate_os_policy_statement_json_1))
 
                 fargate_namespace_manifest = eks_cluster.add_manifest("FargateLoggingNamespace", {
@@ -1937,7 +1905,7 @@ class EKSClusterStack(core.Stack):
                 print("You need to set only one destination for Fargate Logs to True")
 
 
-app = core.App()
+app = App()
 if app.node.try_get_context("account").strip() != "":
     account = app.node.try_get_context("account")
 else:
@@ -1952,5 +1920,5 @@ else:
 # Note that if we didn't pass through the ACCOUNT and REGION from these environment variables that
 # it won't let us create 3 AZs and will only create a max of 2 - even when we ask for 3 in eks_vpc
 eks_cluster_stack = EKSClusterStack(
-    app, "EKSClusterStack", env=core.Environment(account=account, region=region))
+    app, "EKSClusterStack", env=Environment(account=account, region=region))
 app.synth()
